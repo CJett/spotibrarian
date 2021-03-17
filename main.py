@@ -5,6 +5,7 @@ import os
 import pandas as pd
 import spotipy
 import sys
+from dotenv import load_dotenv
 from PyQt5 import QtWidgets as qtw, QtGui as qtg, QtCore as qtc, uic
 from spotipy.oauth2 import SpotifyOAuth
 
@@ -31,7 +32,7 @@ class Spotibrarian:
         self._ui = uic.loadUi('ui/main.ui')
         scope = 'user-library-read playlist-modify-public'
         cid = "72e180d9f7a54590a1214f158cb264b5"
-        cs = "20f168e6f0b94f098c495f6bca4df90d"
+        cs = os.getenv("CLIENT_SECRET")
         self._sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope=scope, client_id=cid, client_secret=cs,
                                                              redirect_uri="http://localhost:8888/callback"))
         self._init_library()
@@ -184,6 +185,7 @@ class Spotibrarian:
 
 
 if __name__ == "__main__":
+    load_dotenv()
     app = qtw.QApplication(sys.argv)  # Create an instance of QtWidgets.QApplication
     window = Spotibrarian()  # Create an instance of our class
     app.exec_()  # Start the application
