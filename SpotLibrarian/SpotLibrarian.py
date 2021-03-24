@@ -4,6 +4,7 @@ import pandas as pd
 import urllib.request
 import json
 from PyQt5 import QtWidgets as qtw, QtGui as qtg, QtCore as qtc, uic
+from SpotLibrarian.SongData import SongData
 
 
 class SpotLibrarian:
@@ -69,7 +70,7 @@ class SpotLibrarian:
         self._ui.setWindowTitle(self._title + f" {len(self._library)} songs")
 
 
-    def update_track(library, track):
+    def update_track(self, library, track):
         if track['uri'] not in library:
             new_data = {
                 'name': track['name'],
@@ -137,42 +138,15 @@ class SpotLibrarian:
         while songs.topLevelItemCount():
             songs.takeTopLevelItem(0)
 
-        ft = self._ui.leFilter.text().strip().lower()
-        if len(ft) < 2:
-            ft = ''
+        filter_tokens = self._ui.leFilter.text().strip().lower().split(' ')  # clean raw filter string
+        filter = list(filter(bool, filter_tokens))  # remove emptystring elements
 
-        ft = [f.strip() for f in ft.split(' ') if f.strip() != '']
         for uri, data in self._library.items():
-            can_add = True
-            if not len(ft) == 0:
-                for ftp in ft:
-                    if ftp != '':
-                        part_can_add = False
-                        if ftp in uri.lower() or \
-                           ftp in data['name'].lower() or \
-                           ftp in data['album_name'].lower():
-                            part_can_add = True
-
-                        if not part_can_add:
-                            for artist in data['artists']:
-                                if ftp in artist.lower():
-                                    part_can_add = True
-                                    break
-                        if not part_can_add:
-                            for tag in data['tags']:
-                                if ftp in tag.lower():
-                                    part_can_add = True
-                                    break
-                        if not part_can_add:
-                            can_add = False
-                            break
-            if can_add:
-                songs.addTopLevelItem(qtw.QTreeWidgetItem([data['name'],
-                                                           ', '.join(data['artists']),
-                                                           data['album_name'],
-                                                           uri,
-                                                           ', '.join(data['tags'])]))
+            song_data = SongData(uri, data)
+            if any([song_data.filter_string(filter_part) for filter_part in filter]):
+                songs.addTopLevelItem(qtw.QTreeWidgetItem(song_data.to_songlist()))
             # self._ui.update()
+
         self._save_library()
         if row > -1:
             if row < self._ui.twSongs.topLevelItemCount():
