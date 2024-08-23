@@ -250,16 +250,31 @@ class Library:
             if v in names:
                 self.unfollow_playlist(k)
         for name, title, query in self.playlists:
-            pl = self.sp.user_playlist_create(self.user_id, name, public=False, description=title or query)['uri']
-            print(pl)
+            while True:
+                try:
+                    log.debug(f"Create playlist {name}")
+                    pl = self.sp.user_playlist_create(self.user_id, name, public=False, description=title or query)['uri']
+                    break
+                except Exception as e:
+                    log.debug("Retry:", exc_info=e)
+            log.debug(f"ID {pl}")
             songs = [s[0] for s in self.search_tracks(tag_query = query)]
             random.shuffle(songs)
             while len(songs) > 50:
-                log.debug(f"Adding {songs[:50]}")
-                self.sp.playlist_add_items(pl, songs[:50])
-                songs = songs[50:]
-            log.debug(f"Adding {songs}")
-            self.sp.playlist_add_items(pl, songs)
+                log.debug(f"{len(songs)} songs left...")
+                try:
+                    self.sp.playlist_add_items(pl, songs[:50])
+                    songs = songs[50:]
+                except Exception as e:
+                    log.debug("Retry:", exc_info=e)
+            while songs:
+                log.debug(f"Adding {len(songs)}")
+                try:
+                    self.sp.playlist_add_items(pl, songs[:50])
+                    songs = []
+                except Exception as e:
+                    log.debug("Retry:", exc_info=e)
+        log.info(f"Created {len(self.playlists)} playlists.")
 
     def add_playlist(self, name, desc, query):
         self.cur.execute(f"""INSERT OR REPLACE INTO playlists VALUES ("{name}", "{desc}", "{query}")""")
