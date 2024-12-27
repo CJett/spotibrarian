@@ -1,8 +1,5 @@
-# TODO make sync songs button
-# TODO make sync not blow away tags
-# TODO make removing tags apply
+# TODO remove unfollowed songs from db
 # TODO rename tags
-# TODO purge unused tags
 # TODO fully implement logging
 
 import os
@@ -23,18 +20,40 @@ AI= os.environ["OPENAI_SECRET_KEY"]
 
 NAME = "SpotiBrarian"
 VERSION = "0.0.0"
-SCOPE = 'user-library-read playlist-modify-public user-read-playback-state user-modify-playback-state'
+SCOPE = 'user-library-read playlist-modify-public playlist-modify-private user-read-playback-state user-modify-playback-state'
 URL = "http://localhost:8888/callback"
 PROMPT = {
     'role': 'system',
-    'content': f"""Fully describe the song using one-word tags. Include lyrics language, or 'lyricless'. Respond comma separated."""
+    'content': f"""
+For the given song and existing tag list, return a comma-separated list of tags thoroughly describing the song.
+A few rules:
+* tags must be one word
+* tags must be simple and plain
+* try to reuse tags if possible
+* include the "feel" of the song
+* include the genre
+* include the language, if not english.
+* include 'instrumental' if there are no vocals.
+"""
 }
-
+PROMPT_PLAYLIST = {
+    'role': 'system',
+    'content': f"""
+For the given playlist name and description, create a fitting SQLite query for the following tags. 
+Example: "chill bluegrass with lyrics" -> "chill AND (bluegrass OR country OR folk) AND NOT acoustic"
+A few rules:
+* Feel free to make it as complicated as you want. 
+* use lowercase for tag names, UPPERCASE FOR AND/OR/NOT.
+* use appropriate parentheses for nested logic.
+* every tag in your query MUST exist in the provided list.
+* Respond only with the query, with no explanation or quotation marks.
+"""
+}
 log = logging.getLogger("Spotibrarian")
 hdlr = logging.StreamHandler()
 log.addHandler(hdlr)
 log.setLevel(logging.DEBUG)
-
+total_tokens = 0
 class TWI(qtw.QTreeWidgetItem):
     def __init__(self, vals:list):
         super().__init__([str(v) for v in vals])
@@ -87,20 +106,22 @@ class Library:
     def _add_tracks(self, tracks):
         for track in tracks:
             track = track['track']
-            self.cur.execute('''INSERT INTO tracks 
-                    (uri, url, name, artist, album_name, duration, artwork) VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                             (track['uri'],
-                              track['external_urls']['spotify'],
-                              track['name'],
-                              ', '.join([t['name'] for t in track['artists']]),
-                              track['album']['name'],
-                              track['duration_ms'],
-                              track['album']['images'][0]['url']))
+            if not self.db.execute(f"""SELECT * FROM tracks WHERE uri='{track['uri']}'""").fetchall():
+                log.debug(f"Add {track['name']}")
+                self.cur.execute('''INSERT INTO tracks 
+                        (uri, url, name, artist, album_name, duration, artwork) VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                                 (track['uri'],
+                                  track['external_urls']['spotify'],
+                                  track['name'],
+                                  ', '.join([t['name'] for t in track['artists']]),
+                                  track['album']['name'],
+                                  track['duration_ms'],
+                                  track['album']['images'][0]['url']))
         self.db.commit()
 
     def fetch_track_library(self):
         log.debug(f"Fetching tracks...")
-        self.cur.execute('''DELETE FROM tracks''')
+        # self.cur.execute('''DELETE FROM tracks''')
         results = self.sp.current_user_saved_tracks()
         self._add_tracks(results['items'])
         while results['next']:
@@ -110,15 +131,17 @@ class Library:
 
         log.info(f"fetched {self.num_tracks} tracks")
         self.db.commit()
-
+    def purge_db(self):
+        self.cur.execute('''DELETE FROM tracks''')
     def set_tag(self, uri, tag, value):
         self.create_tag(tag)
         self.cur.execute(f"UPDATE tracks SET '{tag}' = {value} WHERE uri = '{uri}'")
         self.db.commit()
 
     def set_tags(self, uri, tags):
-        for tag in tags:
-            self.set_tag(uri, tag, 1)
+        for tag in self.tags+tags:
+            self.set_tag(uri, tag, tag in tags)
+        self.purge_unused_tags()
 
     def create_tag(self, tag):
         if tag in self.tags:
@@ -155,24 +178,36 @@ class Library:
             'artwork': t[6],
         }
 
+    def purge_unused_tags(self):
+        for tag in self.tags:
+            if not self.filter_tags(tag):
+                print(tag)
+                log.debug(f"Purge tag {tag}")
+                self.db.execute(f"""ALTER TABLE tracks DROP COLUMN '{tag}'""")
+        self.db.commit()
+
     def get_track_tags(self, uri):
         t = self.cur.execute(f"SELECT * FROM tracks WHERE uri = '{uri}'").fetchone()
         return [name for name, tag in zip (self.tags, t[7:]) if tag]
 
-    def search_tracks(self, like_query="", tag_query=""):
+    def search_tracks(self, like_query="", tag_query="", safe=True):
         try:
             like_query = like_query.strip().lower()
             tag_query = tag_query.strip().lower()
             return self.cur.execute(f"SELECT * FROM tracks WHERE ((uri LIKE ? OR url LIKE ? OR name LIKE ? OR artist LIKE ? OR album_name LIKE ?){f'AND ({tag_query})' if tag_query else ''})", ['%' + like_query + '%'] * 5).fetchall()
-        except:
-            print(traceback.format_exc())
-            return []
-
+        except Exception as e:
+            if safe:
+                print(traceback.format_exc())
+                return []
+            else:
+                raise e
 
 
     def filter_tags(self, tag_query):
-        return self.cur.execute(f"SELECT uri FROM tracks WHERE {tag_query}").fetchall()
-
+        try:
+            return self.cur.execute(f"SELECT uri FROM tracks WHERE {tag_query}").fetchall()
+        except:
+            return []
 
     def play_tracks(self, uris):
         try:
@@ -209,7 +244,7 @@ class Library:
             results = self.sp.next(results)
             for playlist in results['items']:
                 ret[playlist['id']] = playlist['name']
-
+        log.debug(ret)
         return ret
 
     def unfollow_playlist(self, playlist):
@@ -236,13 +271,51 @@ class Library:
         song = f"{info['artist']} - {info['name']}"
         resp = self.ai.chat.completions.create(
             model = "gpt-4o",
-            messages = [PROMPT, {'role':'user','content':song}]
+            messages = [PROMPT, {
+                'role':'user',
+                'content':f'song:"{song}", tags:[{", ".join(self.tags)}]'
+            }],
             # max_tokens=150,  # Adjust the token limit as per your needs
-            # temperature=0.7  # Adjust the creativity level
+            # temperature=0.3  # Adjust the creativity level
         )
-        tags = [t.strip().lower() for t in resp.dict()['choices'][0]['message']['content'].split(",")]
+        tags = []
+
+        for tag in [t.strip().lower() for t in resp.dict()['choices'][0]['message']['content'].split(",")]:
+            tag = ''.join(t for t in tag if t.isalpha())
+            if len(tag) > 2:
+                tags.append(tag)
+
         print(song, tags)# " | ".join([f"{t}:{r}" for t, r in zip(self.tags,resp.dict()['choices'][0]['message']['content'])]))
+        # print(resp.dict())
+        tokens = resp.dict()['usage']['total_tokens']
+        global total_tokens
+        total_tokens += tokens
+        print("tokens", tokens, "total", total_tokens, "total $", 5*total_tokens/1_000_000)
         self.set_tags(uri, tags)
+
+    def ai_playlist(self, name, desc):
+        warning = ""
+        while True:
+            resp = self.ai.chat.completions.create(
+                model = "gpt-4o",
+                messages = [PROMPT_PLAYLIST, {
+                    'role':'user',
+                    'content':f'{warning}\nname:"{name}", description:"{desc}", tags:[{", ".join(self.tags)}]'
+                }],
+                # max_tokens=150,  # Adjust the token limit as per your needs
+                temperature=0.8  # Adjust the creativity level
+            )
+            query = resp.dict()['choices'][0]['message']['content'].strip().replace('"', "")
+            log.info(query)
+            warning = f"The last query, \"{query}\", didn't work:  "
+            logging.info(query)
+            try:
+                self.search_tracks(tag_query = query, safe=False)
+                return query
+            except Exception as e:
+                log.info(str(e))
+                warning += str(e)+". Please try again."
+
 
     def apply_playlists(self):
         names = [p[0] for p in self.playlists]
@@ -250,6 +323,7 @@ class Library:
             if v in names:
                 self.unfollow_playlist(k)
         for name, title, query in self.playlists:
+            name = "*" + name
             while True:
                 try:
                     log.debug(f"Create playlist {name}")
@@ -347,6 +421,14 @@ class Spotibrarian(qtw.QMainWindow):
         self.song_table.setRootIsDecorated(False)
         self.song_table.setHeaderLabels(["UID", "Name", "Artist", "Album", "Tag Count"])
         self.song_table.selectionModel().selectionChanged.connect(self.update_song_info)
+        pb_get_tracks = qtw.QPushButton("Sync Tracks With Spotify")
+        pb_get_tracks.clicked.connect(self.lib.fetch_track_library)
+        pb_get_tracks.clicked.connect(self.update_page)
+        pb_unfollow_all = qtw.QPushButton("Unfollow All Spotify Playlists")
+        pb_unfollow_all.clicked.connect(self.unfollow_all)
+        pb_purge = qtw.QPushButton("Purge DB")
+        pb_purge.clicked.connect(self.pb_purge)
+
         pb_auto = qtw.QPushButton("Auto-Tag All")
         pb_auto.clicked.connect(self.auto_all)
 
@@ -361,18 +443,24 @@ class Spotibrarian(qtw.QMainWindow):
         self.song_label.setFont(fnt)
         self.song_tags = qtw.QPlainTextEdit()
         self.song_tags.setPlaceholderText("Set tags here...")
+        self.pb_auto_tag = qtw.QPushButton("Auto-Tag")
+        self.pb_auto_tag.clicked.connect(self.auto_tag)
         self.pb_apply_tags = qtw.QPushButton("Apply")
         self.pb_apply_tags.clicked.connect(self.apply_tags)
 
         song_l.addWidget(self.tag_query, 0,0)
         song_l.addWidget(self.like_query, 1,0)
         song_l.addWidget(self.song_table, 2,0, 3, 1)
-        song_l.addWidget(pb_auto, 5,0)
+        song_l.addWidget(pb_get_tracks, 5,0)
+        song_l.addWidget(pb_auto, 6,0)
+        song_l.addWidget(pb_unfollow_all, 7,0)
+        song_l.addWidget(pb_purge, 8,0)
 
         song_l.addWidget(self.song_im, 0, 1, 3, 1)
         song_l.addWidget(self.song_label, 3, 1)
         song_l.addWidget(self.song_tags, 4, 1)
-        song_l.addWidget(self.pb_apply_tags, 5, 1)
+        song_l.addWidget(self.pb_auto_tag, 5, 1)
+        song_l.addWidget(self.pb_apply_tags, 6, 1)
 
         pl_l.addWidget(self.playlist_table, 0, 1)
         pl_l.addWidget(pb_new_playlist, 1, 1)
@@ -388,6 +476,15 @@ class Spotibrarian(qtw.QMainWindow):
         self.update_tag_table()
         self.update_song_info()
         self.update_playlists()
+    def unfollow_all(self):
+        if qtw.QMessageBox.question(self, "Unsubscribe?", "Unsubscribe from ALL auto playlists?", qtw.QMessageBox.StandardButton.Yes, qtw.QMessageBox.StandardButton.No) == qtw.QMessageBox.StandardButton.Yes:
+            for k, v in self.lib.fetch_playlists().items():
+                log.info(f"Unsubscribe from {k}")
+                self.lib.unfollow_playlist(k)
+    def pb_purge(self):
+        if qtw.QMessageBox.question(self, "Clear DB?", "Delete all tags and songs from the database?", qtw.QMessageBox.StandardButton.Yes, qtw.QMessageBox.StandardButton.No) == qtw.QMessageBox.StandardButton.Yes:
+            self.lib.purge_db()
+        self.update_page()
 
     def edit_playlist(self, item = None):
         if item is None:
@@ -409,11 +506,15 @@ class Spotibrarian(qtw.QMainWindow):
         le_desc.setText(desc)
         le_desc.setPlaceholderText("Playlist Description (defaluts to query)")
 
-        le_query = qtw.QLineEdit()
-        le_query.setText(query)
+        le_query = qtw.QPlainTextEdit()
+        le_query.setPlainText(query)
         le_query.setPlaceholderText("Playlist Tag Query")
-
+        lb_song_ct = qtw.QLabel("Song Count: -")
+        le_query.textChanged.connect(lambda: lb_song_ct.setText(f"Song Count: {len(self.lib.search_tracks(tag_query=le_query.toPlainText()))}"))
         accept = []
+
+        pb_auto = qtw.QPushButton("Auto-Generate Query")
+        pb_auto.clicked.connect(lambda: le_query.setPlainText(self.lib.ai_playlist(le_name.text(), le_desc.text())))
 
         pb_ok = qtw.QPushButton("Accept")
         pb_ok.clicked.connect(lambda:accept.append(1))
@@ -424,12 +525,14 @@ class Spotibrarian(qtw.QMainWindow):
         d_l.addWidget(le_name)
         d_l.addWidget(le_desc)
         d_l.addWidget(le_query)
+        d_l.addWidget(lb_song_ct)
+        d_l.addWidget(pb_auto)
         d_l.addWidget(pb_ok)
         d_l.addWidget(pb_cancel)
 
         dialog.exec()
         if accept:
-            self.lib.add_playlist(le_name.text().strip(), le_desc.text().strip(), le_query.text().strip())
+            self.lib.add_playlist(le_name.text().strip(), le_desc.text().strip(), le_query.toPlainText().strip())
         self.update_playlists()
 
     def update_playlists(self):
@@ -462,11 +565,13 @@ class Spotibrarian(qtw.QMainWindow):
             self.song_label.setText("\n".join([t if len(t) < 30 else t[:28]+"..." for t in [name, artist, album]]))
             self.song_tags.setPlainText(', '.join(tags))
             self.song_tags.setEnabled(True)
+            self.pb_auto_tag.setEnabled(True)
             self.pb_apply_tags.setEnabled(True)
         else:
             self.song_label.setText("Select a song.")
             self.song_tags.setPlainText('')
             self.song_tags.setEnabled(False)
+            self.pb_auto_tag.setEnabled(False)
             self.pb_apply_tags.setEnabled(False)
 
     def update_song_image(self, im_bytes):
@@ -482,11 +587,19 @@ class Spotibrarian(qtw.QMainWindow):
                 self.song_im.setPixmap(self._image_cache[uri])
         self._image_fetch_uri = ""
 
+    def auto_tag(self):
+        item = self.song_table.selectedItems()[0]
+        uri = item.text(0)
+        self.lib.ai_tag(uri)
+        self.update_tag_table()
+        self.update_page()
+
     def apply_tags(self):
         item = self.song_table.selectedItems()[0]
         uri = item.text(0)
         tags = self.song_tags.toPlainText().split(",")
         tags = [''.join([c if c.isalnum() else '_' for c in tag.strip().lower()]) for tag in tags]
+        # self.lib.clear_tags(uri)
         self.lib.set_tags(uri, tags)
         self.update_tag_table()
         self.update_page()
@@ -529,6 +642,7 @@ class Spotibrarian(qtw.QMainWindow):
                     pbar.setValue(i)
                     qtw.QApplication.processEvents()
                     self.lib.ai_tag(track[0])
+                    self.update_tag_table()
                 if not dialog.isVisible():
                     break
             dialog.close()

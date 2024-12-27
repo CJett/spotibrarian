@@ -162,6 +162,15 @@ try:
         loaded_db = json.loads(f.read())
 except:
     loaded_db = {"playlists":{},"tracks":{}}
+
+for k in loaded_db["playlists"].keys():
+    print(f"unfollow {k}")
+    try:
+        sp.current_user_unfollow_playlist(k)
+    except:
+        print(traceback.format_exc())
+exit()
+
 db = {"playlists":{},"tracks":{}}
 if input("refresh tracks? [y/N]").lower().strip() == "y":
     # update tracks in db
